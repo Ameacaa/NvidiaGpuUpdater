@@ -1,100 +1,136 @@
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium import webdriver
+from bs4 import BeautifulSoup
 from colorama import Fore
 from pathlib import Path
 import subprocess
+import requests
 import urllib3
+import logging
+import sys
 
 
+# Configure logging
+logging.basicConfig(stream=sys.stdout, level=logging.ERROR)
+logger = logging.getLogger(__name__)
+
+NVIDIA_DOWNLOAD_URL = "https://www.nvidia.com/download/driverResults.aspx/224155/en-us/"
 DOWNLOAD_PATH = Path(Path.home(), "Desktop", "GPU_UPDATE")
 
 
-def get_nvidia_driver_version() -> float:
+# My Module Functions
+
+def progress_bar(progress, total, length, pre_text='', colored=True, color_doing=Fore.YELLOW, color_end=Fore.GREEN):
+	color_reset = Fore.RESET
+
+	if progress == total:
+		bar = '-' * length
+		if colored: print(color_end + f'\r{pre_text}[{bar}] 100.00%' + color_reset, end='\n')
+		else: print(f'\r{pre_text}[{bar}] 100.00%', end='\n')
+		return
+
+	percent: float = progress / total * 100
+	done: int = int(percent / (100 / length))
+	todo: int = length - done
+	bar = '-' * done + '.' * todo
+
+	if colored: print(color_doing + f'\r{pre_text}[{bar}] {percent:.2f}%' + color_reset, end='')
+	else: print(f'\r{pre_text}[{bar}] {percent:.2f}%', end='')
+
+
+def download_webfile(url: str, filepath: Path | str, progress_callback=None, create_folder: bool = True, chunk_size: int = 1024 * 1024) -> bool:
+	# Convert filepath to Path object
+	try: filepath = Path(filepath)
+	except TypeError as e: logger.error(f"Invalid file path: {e}"); return False
+
+	# Create parent folder if it doesn't exist
+	if create_folder: filepath.parent.mkdir(exist_ok=True, parents=True)
+
+	try:
+		# Start HTTP request session
+		with urllib3.PoolManager() as http:
+			# Send HTTP GET request with streaming enabled
+			with http.request('GET', url, preload_content=False) as response:
+				# Get content length from response headers
+				content_length = int(response.headers['Content-Length'])
+				logger.info(f"Downloading {url} to {filepath} ({content_length} bytes)")
+
+				# Open file for writing in binary mode
+				with open(str(filepath), 'wb') as f:
+					downloaded_bytes = 0
+					# Iterate over response content in chunks
+					for chunk in response.stream(chunk_size):
+						# Write chunk to file
+						f.write(chunk)
+						downloaded_bytes += len(chunk)
+						# Calculate download progress
+						progress = min(int(downloaded_bytes / content_length * 100), 100)
+						# Call the progress callback, if provided
+						if progress_callback: progress_callback(progress)
+
+		logger.info(f"\nDownload complete")
+		return True
+
+	# Catch HTTP errors
+	except urllib3.exceptions.HTTPError as e: logger.error(f"HTTP Error: {e}"); return False
+	# Catch OS errors
+	except OSError as e: logger.error(f"OS Error: {e}"); return False
+	# Catch other exceptions
+	except Exception as e: logger.error(f"An error occurred: {e}"); return False
+
+
+# Projects Functions
+
+def download_webfile_callback(progress: int):
+	progress_bar(progress, 100, 40, "Downloading: ", Fore.MAGENTA)
+
+
+def get_local_version() -> float | None:
 	try:
 		result = subprocess.run(['nvidia-smi', '--query-gpu=driver_version', '--format=csv,noheader'], capture_output=True, text=True)
-		return float(result.stdout.strip()) if result.returncode == 0 else -1.0
+		if result.returncode == 0:
+			driver_version = float(result.stdout.strip())
+			return driver_version
+		else:
+			return None  # Indicate failure
 	except FileNotFoundError:
-		return 0.0
+		raise FileNotFoundError("nvidia-smi command not found")
+	except subprocess.CalledProcessError:
+		raise RuntimeError("Error while running nvidia-smi command")
 
 
-def get_chrome_webdriver(headless: bool = True):
-	service = None  # Service(ChromeDriverManager().install())
-	options = webdriver.ChromeOptions()
-	options.add_experimental_option('detach', True)
-	options.add_argument('--mute-audio')
-	options.add_argument('--ignore-ssl-errors=yes')
-	options.add_argument('--ignore-certificate-errors')
-	options.add_experimental_option("excludeSwitches", ["enable-logging"])
-	if headless: options.add_argument('--headless=new')
-	return webdriver.Chrome(options=options, service=service)
+def get_online_version(soup: BeautifulSoup):
+	return float(str(soup.find(id="tdVersion").text).strip().split()[0])
 
 
-def get_scraped_infos():
-	try:
-		driver = get_chrome_webdriver(headless=True)
-		driver.implicitly_wait(20)
-		driver.get("https://www.nvidia.com/download/index.aspx")
-
-		# Page 1 - Select in dropboxes what GPU we want to check
-		driver.find_element(By.XPATH, '//*[@id="selProductSeriesType"]/option[1]').click()  # Product Type
-		driver.find_element(By.XPATH, '//*[@id="selProductSeries"]/option[14]').click()  # Product Serie
-		driver.find_element(By.XPATH, '//*[@id="selProductFamily"]/option[5]').click()  # Product
-		driver.find_element(By.XPATH, '//*[@id="selOperatingSystem"]/option[3]').click()  # OS
-		driver.find_element(By.XPATH, '//*[@id="ddlDownloadTypeCrdGrd"]/option[1]').click()  # Download Type
-		driver.find_element(By.XPATH, '//*[@id="ddlLanguage"]/option[1]').click()  # Language
-		driver.find_element(By.XPATH, '//*[@id="ManualSearchButtonTD"]/a').click()  # Click Search Button
-
-		# Page 2 - Get the version and click the first download button
-		avaliable_version = float(driver.find_element(By.XPATH, '//*[@id="tdVersion"]').text.split()[0])
-		driver.find_element(By.XPATH, '//*[@id="lnkDwnldBtn"]').click()
-
-		# Page 3 - Click the second download button
-		download_url = driver.find_element(By.XPATH, '//*[@id="mainContent"]/table/tbody/tr/td/a').get_attribute("href")
-
-		driver.close()
-
-		return float(avaliable_version), download_url
-	except:
-		return "", ""
+def get_download_url(soup: BeautifulSoup):
+	new_soup = BeautifulSoup(requests.get(f"https://www.nvidia.com{soup.find(id="lnkDwnldBtn")["href"]}").text, 'lxml')
+	return f"https:{new_soup.find_all("a")[9]["href"]}"
 
 
-def download_webfile(url: str, filepath: Path | str, create_folder: bool = True, chunk_size: int = 1073741824) -> bool:
-	try: _file = Path(filepath)
-	except Exception as e: print(e); return False
+def main():
+	soup = BeautifulSoup(requests.get(NVIDIA_DOWNLOAD_URL).text, 'lxml')
 
-	if create_folder: _file.parent.mkdir(exist_ok=True, parents=True)
+	# Get installed driver version
+	local_version = get_local_version()
+	if local_version is None: print(f"{Fore.RED}Driver version not found - Retry Later{Fore.RESET}"); return
+	print(f"{Fore.CYAN}Installed driver version found: {local_version}{Fore.RESET}")
 
-	try:
-		lib = urllib3.PoolManager()
-		response = lib.request('GET', url, preload_content=False)
-		with open(str(filepath), 'wb') as f:
-			data = response.read(chunk_size)
-			if not data: pass
-			f.write(data)
-		response.release_conn()
-		return True
-	except Exception as e: print(e); return False
+	# Get online available driver version
+	online_version = get_online_version(soup)
+	print(f"{Fore.MAGENTA}Online available driver version found: {online_version}{Fore.RESET}")
 
+	# Compare versions
+	if online_version == local_version: print(f"{Fore.GREEN}You already have the latest available driver{Fore.RESET}"); return
 
-def driver_checker():
-	local_version = get_nvidia_driver_version()
-	if local_version == -1.0: print(f"{Fore.RED}An error as occured while getting the driver version - Retry Later{Fore.RESET}"); quit()
-	elif local_version == 0.0: print(f"Appears that you have no NVIDIA driver installed - Downloading the latest version")
+	# Create a filepath like 541_14.exe
+	filepath = Path(DOWNLOAD_PATH, f"{str(online_version).replace('.', '_')}.exe")
 
-	online_version, download_url = get_scraped_infos()
-	if online_version == "" or download_url == "": print(f"{Fore.RED}An error as occured while scraping nvidia website - Retry Later{Fore.RESET}"); quit()
+	# Get Download url
+	download_url = get_download_url(soup)
 
-	# Nvidia version => Major.minor.patch => Just check major and minor here
-	print(f"Installed Version: {local_version} | Avaliable Version: {online_version}")
-	if online_version > local_version:
-		print("Downloading latest version")
-		outpath = Path(DOWNLOAD_PATH, f"{str(online_version).replace('.','_')}.exe")  # Example: 541_14.exe
-		if download_webfile(download_url, outpath, True): print(f"{Fore.GREEN}Download done{Fore.RESET}")
-		else: print(f"{Fore.RED}Download Failed{Fore.RESET}")
-	else: print(f"{Fore.GREEN}You have the latest driver{Fore.RESET}")
+	# Download latest driver url
+	if download_webfile(download_url, filepath, download_webfile_callback): print(f"{Fore.GREEN}Download ends successfully{Fore.RESET}")
+	else: print(f"{Fore.RED}Download has an error{Fore.RESET}")
 
 
 if __name__ == '__main__':
-	driver_checker()
+	main()
